@@ -1,4 +1,5 @@
 import { Gaussian, Mat3, Vec3, m3mulVec, mulberry32, v3add, v3cross, v3dot, v3norm, v3scale } from '../core/math';
+import { SensorConvention, accelFromBody, firmwareA, gyroFromBody } from '../core/conventions';
 
 export interface DropoutWindow {
   start: number;
@@ -33,6 +34,10 @@ export interface SimConfig {
   /** Motion ramp start/end: the rig is still before `motionStart`. */
   motionStart: number;
   motionRamp: number;
+  /** Convention the IMU emits samples in; default fw-A (identity, SI units). */
+  imuConvention?: SensorConvention;
+  /** Mid-run firmware swap: samples at physical time ≥ t use the new convention. */
+  firmwareSwap?: { t: number; convention: SensorConvention };
 }
 
 export interface CameraSampleTrue {
@@ -46,6 +51,8 @@ export interface ImuSample {
   t: number;
   gyro: Vec3;
   accel: Vec3;
+  /** Firmware that emitted this sample; samples without a tag pass through unchanged. */
+  fw?: string;
   trueGyroBias?: Vec3;
   trueAccelBias?: Vec3;
 }
@@ -211,6 +218,7 @@ export function generateDataset(cfg: SimConfig): GeneratedDataset {
   let biasWG: Vec3 = [0, 0, 0];
   let biasWA: Vec3 = [0, 0, 0];
   const dtImu = 1 / cfg.imuHz;
+  const convA = cfg.imuConvention ?? firmwareA();
   for (let j = 0; j < nImu; j++) {
     const tNominal = j / cfg.imuHz;
     const tPhys = tNominal + cfg.timeOffset;
@@ -232,10 +240,17 @@ export function generateDataset(cfg: SimConfig): GeneratedDataset {
     const fTrue = motion.accelB(tPhys);
     const noiseG = rng.vec3(cfg.gyroNoise);
     const noiseA = rng.vec3(cfg.accelNoise);
+    // Measurements are formed in the body frame (rad/s, m/s²), then expressed in
+    // the emitting firmware's axes and units. With the default fw-A convention
+    // this conversion is the identity.
+    const conv = cfg.firmwareSwap && tPhys >= cfg.firmwareSwap.t ? cfg.firmwareSwap.convention : convA;
+    const wBody: Vec3 = [wTrue[0] + biasG[0] + noiseG[0], wTrue[1] + biasG[1] + noiseG[1], wTrue[2] + biasG[2] + noiseG[2]];
+    const fBody: Vec3 = [fTrue[0] + biasA[0] + noiseA[0], fTrue[1] + biasA[1] + noiseA[1], fTrue[2] + biasA[2] + noiseA[2]];
     imu.push({
       t: tNominal,
-      gyro: [wTrue[0] + biasG[0] + noiseG[0], wTrue[1] + biasG[1] + noiseG[1], wTrue[2] + biasG[2] + noiseG[2]],
-      accel: [fTrue[0] + biasA[0] + noiseA[0], fTrue[1] + biasA[1] + noiseA[1], fTrue[2] + biasA[2] + noiseA[2]],
+      gyro: gyroFromBody(conv, wBody),
+      accel: accelFromBody(conv, fBody),
+      fw: conv.firmware,
       trueGyroBias: biasG,
       trueAccelBias: biasA,
     });

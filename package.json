@@ -8,7 +8,9 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "validate": "vite build --ssr src/cli/validate.ts --outDir dist-cli --logLevel warn && node dist-cli/validate.js",
+    "docs:conventions": "vite build --ssr src/cli/docExamples.ts --outDir dist-cli --logLevel warn && node dist-cli/docExamples.js"
   },
   "repository": {
     "type": "git",

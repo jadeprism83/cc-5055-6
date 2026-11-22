@@ -1,9 +1,13 @@
-import { Mat3, Vec3, v3norm, v3sub } from '../core/math';
-import { project, worldToCamera } from '../core/camera';
+import { Mat3, Vec3 } from '../core/math';
+import { cameraCenterWorld, project, worldToCamera } from '../core/camera';
+import { firmwareB } from '../core/conventions';
 import { makeNoise } from '../estimation/eskf';
 import { InertialLensKernel, KernelFrame, KernelOptions, defaultKernelOptions } from '../lens/kernel';
 import { buildCapture, Capture, defaultCaptureConfig, sessionFromCapture } from '../lens/replay';
 import { absoluteTrajectoryError } from '../lens/evaluate';
+import { firmwareBRecord } from '../lens/record';
+import { PoseSnapshot, groundContactProjection, markerProjection } from '../lens/overlays';
+import { generateDataset } from '../sim/trajectory';
 
 // The lens-tracking window. Every control drives the InertialLensKernel, and
 // every number shown is read back from it. The kernel never sees truth; the
@@ -112,8 +116,17 @@ let kernelOptions: KernelOptions;
 let playing = false;
 let playTimer: number | null = null;
 let collected: Array<{ idx: number; est: Vec3; truth: Vec3; estR: Mat3; truthR: Mat3; holdout: boolean; status: string }> = [];
+let uiAnomalies: Array<{ frame: number; message: string }> = [];
+let lastMarkerAnomaly = -100;
+let lastContactAnomaly = -100;
 
 const MARKER_WORLD: Vec3 = [4.6, 0.55, 1.25];
+const GROUND_Z = -0.6;
+
+function pushAnomaly(message: string): void {
+  uiAnomalies.push({ frame: kernel.frameIndex, message });
+  if (uiAnomalies.length > 20) uiAnomalies.shift();
+}
 
 function fmt(x: number, d = 2): string {
   if (!Number.isFinite(x)) return '—';
@@ -133,6 +146,8 @@ function buildUI(): void {
       <button id="btnReset">↺ 复位</button>
       <button id="btnAid" class="toggle-on">惯性辅助：开</button>
       <span style="flex:1"></span>
+      <button id="btnSwapDemo">固件更换演示</button>
+      <button id="btnCommitB">固化 fw-B 标定</button>
       <button id="btnApplyExt" disabled>应用求解外参</button>
       <button id="btnHandeye">重算手眼校验</button>
     </div>
@@ -143,13 +158,15 @@ function buildUI(): void {
           <div class="lens-wrap">
             <canvas id="lens" width="320" height="240"></canvas>
             <div class="lens-badge" id="lensBadge"><span class="dot" style="background:#6e7681"></span>待机</div>
-            <div class="marker-legend">固定虚拟标记 <span class="c">◯ 估计</span> <span class="m">+ 真值</span></div>
+            <div class="marker-legend">固定虚拟标记 <span class="c">◯ 估计</span> <span class="m">+ 真值</span> · 地面接触点 <span class="c">◇</span> <span class="m">◇</span></div>
           </div>
           <div class="status-line">
             <span>状态 <b id="sStatus">待机</b></span>
             <span>帧 <b id="sFrame">0</b></span>
             <span>跟踪点 <b id="sTracks">0</b></span>
             <span>标记偏差 <b id="sMarker">—</b> px</span>
+            <span>触点偏差 <b id="sContact">—</b> m</span>
+            <span>标定 <b id="sRecord">—</b></span>
           </div>
         </div>
         <div class="panel" style="margin-top:14px">
@@ -196,6 +213,8 @@ function buildUI(): void {
             <span><i class="sw" style="background:#6e7681"></i>真值</span>
             <span><i class="sw dot" style="background:#d29922"></i>留出帧</span>
             <span><i class="sw dot" style="background:#58a6ff"></i>当前位置</span>
+            <span><i class="sw dot" style="background:#39c5cf"></i>触点估计</span>
+            <span><i class="sw dot" style="background:#db61a2"></i>触点真值</span>
             <span id="ateText" style="color:#a9b4c0"></span>
           </div>
         </div>
@@ -224,6 +243,59 @@ function buildUI(): void {
     b.textContent = `惯性辅助：${on ? '开' : '关'}`;
     b.className = on ? 'toggle-on' : 'danger';
     renderEvents();
+  };
+  $('btnSwapDemo').onclick = () => {
+    stopPlay();
+    // Same rig, same imagery: only the IMU stream is regenerated with a
+    // mid-run firmware swap at t = 6 s. fw-B has no committed calibration, so
+    // its samples are dropped and inertial propagation pauses with warnings.
+    const ds = generateDataset({ ...cap.config, firmwareSwap: { t: 6.0, convention: firmwareB() } });
+    kernel.session.replaceImu(ds.imu);
+    kernel.resetState();
+    collected = [];
+    kernel.bootstrap();
+    pushAnomaly('固件更换演示：t≥6.0 s 的样本来自 fw-B（未固化标定），惯推将暂停并告警，不会用默认轴系换算');
+    if (kernel.frames.length) { const rec = kernel.frames[kernel.frames.length - 1]; renderFrame(rec); renderResiduals(rec); }
+    renderEvents();
+    updateLedger();
+  };
+  $('btnCommitB').onclick = () => {
+    stopPlay();
+    // Snapshot stamped with the current generation, captured before the commit.
+    const pose = kernel.currentPose();
+    const oldSnap: PoseSnapshot | null = pose
+      ? {
+          recordId: kernel.record.id,
+          generation: kernel.record.generation,
+          t: kernel.session.cameraTimes[kernel.frameIndex] ?? 0,
+          R_wb: pose.R_wb,
+          p_wb: pose.p_wb,
+        }
+      : null;
+    const gen = kernel.record.generation;
+    if (!kernel.commitFirmware(firmwareBRecord(gen + 1, kernel.extrinsics, kernel.timeOffset))) {
+      renderEvents();
+      return;
+    }
+    // Reflashed rig: the whole stream now follows fw-B, whose convention the
+    // freshly committed record carries. Re-bootstrap under the new conversion.
+    const ds = generateDataset({ ...cap.config, imuConvention: firmwareB() });
+    kernel.session.replaceImu(ds.imu);
+    collected = [];
+    kernel.bootstrap();
+    if (oldSnap) {
+      const m = markerProjection(oldSnap, kernel.record, kernel.extrinsics, kernel.session.K, MARKER_WORLD);
+      const c = groundContactProjection(oldSnap, kernel.record, kernel.extrinsics, kernel.session.K, GROUND_Z);
+      if (m === null && c === null) {
+        pushAnomaly(`旧换算快照（代 ${gen}）被角标与虚拟地面接触点同时拒绝`);
+      } else {
+        pushAnomaly(`异常：代 ${gen} 的旧换算快照未被拒绝（角标 ${m === null ? '拒' : '收'}，触点 ${c === null ? '拒' : '收'}）`);
+      }
+    }
+    pushAnomaly(`已固化 fw-B 标定（代 ${gen + 1}）：陀螺积分与快门去斜改用 fw-B 约定`);
+    if (kernel.frames.length) { const rec = kernel.frames[kernel.frames.length - 1]; renderFrame(rec); renderResiduals(rec); }
+    renderEvents();
+    updateLedger();
   };
   $('btnApplyExt').onclick = () => {
     kernel.applySolvedExtrinsic();
@@ -326,6 +398,7 @@ function resetRun(): void {
   stopPlay();
   kernel.resetState();
   collected = [];
+  uiAnomalies = [];
   const b = document.getElementById('btnPlay') as HTMLButtonElement;
   b.textContent = '▶ 开始惯性镜头';
   b.className = 'primary';
@@ -402,7 +475,6 @@ function renderFrame(rec: KernelFrame): void {
   // the visible stability check.
   const ext = kernel.extrinsics;
   const K = kernel.session.K;
-  const estPose = kernel.currentPose();
   let markerGap = NaN;
   const pHat = project(worldToCamera(rec.R_wb, rec.p_wb, ext, MARKER_WORLD), K);
   const pTrue = project(worldToCamera(cap.truthR[idx], cap.truthP[idx], ext, MARKER_WORLD), K);
@@ -424,13 +496,54 @@ function renderFrame(rec: KernelFrame): void {
     ctx.stroke();
   }
   if (inImg(pTrue) && inImg(pHat)) markerGap = Math.hypot(pHat.u - pTrue.u, pHat.v - pTrue.v);
-  void estPose;
+
+  // Virtual ground contact: the world point straight below the camera centre.
+  // Drawn as diamonds when it falls inside the image; the horizontal gap
+  // between estimate and truth is always reported in the status line.
+  const cEst = cameraCenterWorld(rec.R_wb, rec.p_wb, ext);
+  const cTrue = cameraCenterWorld(cap.truthR[idx], cap.truthP[idx], ext);
+  const contactGap = Math.hypot(cEst[0] - cTrue[0], cEst[1] - cTrue[1]);
+  const contactEstWorld: Vec3 = [cEst[0], cEst[1], GROUND_Z];
+  const contactTrueWorld: Vec3 = [cTrue[0], cTrue[1], GROUND_Z];
+  const pcHat = project(worldToCamera(rec.R_wb, rec.p_wb, ext, contactEstWorld), K);
+  const pcTrue = project(worldToCamera(cap.truthR[idx], cap.truthP[idx], ext, contactTrueWorld), K);
+  const diamond = (p: { u: number; v: number }, r: number) => {
+    ctx.beginPath();
+    ctx.moveTo(p.u, p.v - r); ctx.lineTo(p.u + r, p.v); ctx.lineTo(p.u, p.v + r); ctx.lineTo(p.u - r, p.v);
+    ctx.closePath();
+    ctx.stroke();
+  };
+  if (inImg(pcTrue)) {
+    ctx.strokeStyle = 'rgba(219,97,162,0.95)';
+    ctx.lineWidth = 1.5;
+    diamond(pcTrue, 6);
+  }
+  if (inImg(pcHat)) {
+    ctx.strokeStyle = 'rgba(57,197,207,0.95)';
+    ctx.lineWidth = 2;
+    diamond(pcHat, 7);
+  }
+
+  // Anomalies are surfaced to the event panel, throttled to stay readable.
+  if (Number.isFinite(markerGap) && markerGap > 6 && idx - lastMarkerAnomaly > 30) {
+    lastMarkerAnomaly = idx;
+    pushAnomaly(`帧 ${idx}：角标偏差 ${markerGap.toFixed(1)} px 超阈值（估计与真值投影分离）`);
+    renderEvents();
+  }
+  if (contactGap > 0.5 && idx - lastContactAnomaly > 30) {
+    lastContactAnomaly = idx;
+    pushAnomaly(`帧 ${idx}：虚拟地面接触点偏差 ${contactGap.toFixed(2)} m 超阈值`);
+    renderEvents();
+  }
 
   (document.getElementById('sFrame') as HTMLElement).textContent = String(idx);
   (document.getElementById('sTracks') as HTMLElement).textContent = String(rec.tracks);
   const mk = document.getElementById('sMarker') as HTMLElement;
   mk.textContent = Number.isFinite(markerGap) ? markerGap.toFixed(2) : '—';
   mk.className = Number.isFinite(markerGap) ? classFor(markerGap, 2, 6) : '';
+  const ct = document.getElementById('sContact') as HTMLElement;
+  ct.textContent = contactGap.toFixed(3);
+  ct.className = classFor(contactGap, 0.2, 0.5);
 
   setStatusBadge(rec.status);
   drawTrajectory();
@@ -455,6 +568,8 @@ function renderResiduals(rec: KernelFrame): void {
   const c = kernel.counts();
   set('rLm', String(c.landmarks), c.landmarks > 50 ? 'ok' : c.landmarks > 10 ? 'warn' : 'err');
   set('rReloc', String(c.relocalisations), '');
+  const cal = kernel.record;
+  set('sRecord', `${cal.firmware} · 代 ${cal.generation} · ${cal.status === 'committed' ? '已固化' : '预览'}`, cal.status === 'committed' ? 'ok' : 'warn');
   (document.getElementById('rEffect') as HTMLElement).textContent = rec.effect;
 }
 
@@ -514,6 +629,24 @@ function drawTrajectory(): void {
   ctx.arc(lx, ly, 4, 0, Math.PI * 2);
   ctx.fill();
 
+  // Virtual ground contacts (top view): the point straight below the camera.
+  const ext = kernel.extrinsics;
+  const contactOf = (R_wb: Mat3, p_wb: Vec3): Vec3 => {
+    const C = cameraCenterWorld(R_wb, p_wb, ext);
+    return [C[0], C[1], GROUND_Z];
+  };
+  const drawContact = (p: Vec3, color: string) => {
+    const [x, y] = toScreen(p);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 5); ctx.lineTo(x + 5, y); ctx.lineTo(x, y + 5); ctx.lineTo(x - 5, y);
+    ctx.closePath();
+    ctx.stroke();
+  };
+  drawContact(contactOf(last.estR, last.est), '#39c5cf');
+  drawContact(contactOf(last.truthR, last.truth), '#db61a2');
+
   // ATE with similarity alignment; scale reported separately as evidence.
   const est = collected.map((c) => c.est);
   const truth = collected.map((c) => c.truth);
@@ -525,9 +658,14 @@ function drawTrajectory(): void {
 function renderEvents(): void {
   const el = document.getElementById('events') as HTMLElement;
   const evs = kernel.events.slice(-60);
-  el.innerHTML = evs
+  const kernelHtml = evs
     .map((e) => `<div class="ev ${e.severity}"><span class="f">[${e.frame}]</span> <span class="m">${e.message}</span></div>`)
     .join('');
+  const uiHtml = uiAnomalies
+    .slice(-10)
+    .map((a) => `<div class="ev warn"><span class="f">[${a.frame}]</span> <span class="m">界面：${a.message}</span></div>`)
+    .join('');
+  el.innerHTML = kernelHtml + uiHtml;
   el.scrollTop = el.scrollHeight;
 }
 
@@ -556,6 +694,13 @@ function updateLedger(): void {
   add('手眼校验', hc ? `${hc.message}（${hc.pairs} 对，残差 ${fmt(hc.residualDeg)}°）` : '未运行。', hc && hc.residualDeg < 1.5 ? 'good' : 'mid');
   add('陀螺偏置', `${b ? b.bg.map((v) => v.toExponential(1)).join(', ') : '—'} rad/s，来自静止窗口直接测量。`, 'good');
   add('加计偏置', '不单独测量；与重力耦合、缓慢可估，短窗口不可分离。', 'mid');
+  const cal = kernel.record;
+  add(
+    '传感约定',
+    `${cal.firmware}（${cal.convention.gyroUnit}，${cal.convention.accelUnit}），代 ${cal.generation}，` +
+      `${cal.status === 'committed' ? '已固化' : '预览：镜像歧义未排除'}；预积分器与快门补偿器共用同一标定记录。`,
+    cal.status === 'committed' ? 'good' : 'mid',
+  );
   add('留出检验', '每 11 帧抽出不参与视觉更新的帧，仅惯推，用于独立核对（橙色点）。', 'good');
   if (b) {
     add('固定虚拟标记', '世界坐标锚定；图像内青色环（估计）与洋红十字（真值）应重合。', 'good');
@@ -603,8 +748,5 @@ function boot(): void {
     (document.getElementById('btnStep') as HTMLButtonElement).disabled = false;
   }, 60);
 }
-
-void v3norm;
-void v3sub;
 
 boot();

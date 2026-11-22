@@ -1,12 +1,9 @@
 import {
   Mat3,
   Vec3,
-  m3identity,
   m3mul,
-  m3mulVec,
   m3transpose,
   so3Log,
-  v3add,
   v3norm,
   v3sub,
 } from '../core/math';
@@ -23,6 +20,8 @@ import {
   TriangulationView,
 } from './bootstrap';
 import { solveHandEyeRotation, HandEyePair } from './calibration';
+import { CalibrationRecord, defaultCalibrationRecord } from './record';
+import { GyroPreintegrator } from './preintegration';
 import { hamming } from '../vision/tracker';
 
 // The inertial-lens kernel. It consumes only sensor-side data (timestamps, raw
@@ -129,6 +128,9 @@ export class InertialLensKernel {
   readonly opts: KernelOptions;
   readonly noise: EskfNoise;
   readonly extrinsics: Extrinsics;
+  /** Calibration record the preintegrator converts samples with. */
+  record: CalibrationRecord;
+  preintegrator: GyroPreintegrator;
 
   status: LensStatus = 'idle';
   frameIndex = 0;
@@ -156,8 +158,9 @@ export class InertialLensKernel {
   private lastGoodFrame = -1;
   private relocalisations = 0;
   private nextLandmarkId = 100000;
+  private lastFirmwareWarnFrame = -100;
 
-  constructor(session: SensorSession, opts: KernelOptions, noise: EskfNoise) {
+  constructor(session: SensorSession, opts: KernelOptions, noise: EskfNoise, record?: CalibrationRecord) {
     this.session = session;
     this.opts = opts;
     this.noise = noise;
@@ -166,6 +169,11 @@ export class InertialLensKernel {
       t_bc: [...session.initialExtrinsics.t_bc],
     };
     this.timeOffset = opts.timeOffsetGuess;
+    this.record = record ?? defaultCalibrationRecord(this.extrinsics, this.timeOffset);
+    this.preintegrator = new GyroPreintegrator(this.record);
+    // The session converts every firmware-tagged sample through the record's
+    // committed convention; samples without a committed convention are dropped.
+    this.session.setConventionResolver((fw) => this.preintegrator.conventionFor(fw));
   }
 
   private log(severity: KernelEvent['severity'], message: string): void {
@@ -190,7 +198,7 @@ export class InertialLensKernel {
     }
     return {
       cameraTimes: this.session.cameraTimes,
-      imu: this.session.imu,
+      imu: this.session.imuBody(),
       bgGuess: [0, 0, 0] as Vec3,
       R_bc: this.extrinsics.R_bc,
       t_bc: this.extrinsics.t_bc,
@@ -221,15 +229,13 @@ export class InertialLensKernel {
       maxLandmarkReprojPx: 2.5,
     });
     this.bootstrapResult = res;
-    if (res.timeOffsetScore < 0.02 && res.timeOffset !== this.opts.timeOffsetGuess) {
+    const keepGivenOffset = res.timeOffsetScore < 0.02 && res.timeOffset !== this.opts.timeOffsetGuess;
+    if (keepGivenOffset) {
       this.log('warn', `时差搜索最小值不显著（RMS ${(res.timeOffsetScore * 57.3).toFixed(2)}°），保留输入时差`);
       res.timeOffset = this.opts.timeOffsetGuess;
-    } else {
-      this.timeOffset = res.timeOffset;
-      this.timeOffsetSource = 'solved';
     }
     this.timeOffset = res.timeOffset;
-    this.timeOffsetSource = res.ok ? 'solved' : this.timeOffsetSource;
+    this.timeOffsetSource = keepGivenOffset ? 'given' : res.ok ? 'solved' : this.timeOffsetSource;
     if (!res.ok) {
       // Keep orientation even without metric scale, but do not claim position.
       this.log('error', res.message);
@@ -256,16 +262,6 @@ export class InertialLensKernel {
         parallax: lm.parallax,
         firstFrame: start,
       });
-    }
-    // Camera centres over the VI window become the initial trajectory display.
-    for (let k = start; k <= end; k++) {
-      const idx = k - start;
-      if (res.metricCenters[idx]) {
-        const p = res.metricCenters[idx];
-        // Body position from camera centre and body orientation at that time.
-        const ii = start === 0 ? 0 : 0;
-        void ii;
-      }
     }
     this.status = 'tracking';
     this.lastTrackingFrame = end;
@@ -314,6 +310,7 @@ export class InertialLensKernel {
     }
     this.extrinsics.R_bc = new Float64Array(this.handEyeCheck.solved);
     this.extrinsicSource = 'solved';
+    this.record.extrinsics = { R_bc: new Float64Array(this.extrinsics.R_bc), t_bc: [...this.extrinsics.t_bc] };
     this.log('info', '已应用手眼旋转外参；平移仍来自输入（旋转外参不能观测平移）');
     // Re-run bootstrap with the corrected rotation; the old map is discarded.
     this.resetState();
@@ -323,6 +320,7 @@ export class InertialLensKernel {
   setTimeOffset(offset: number): void {
     this.timeOffset = offset;
     this.timeOffsetSource = 'given';
+    this.record.timeOffset = offset;
     this.resetState();
     this.log('info', `时差已设回输入值 ${(offset * 1000).toFixed(1)} ms，等待重新初始化`);
   }
@@ -331,8 +329,31 @@ export class InertialLensKernel {
     this.extrinsics.R_bc = new Float64Array(R_bc);
     this.extrinsics.t_bc = [...t_bc];
     this.extrinsicSource = 'given';
+    this.record.extrinsics = { R_bc: new Float64Array(R_bc), t_bc: [...t_bc] };
     this.resetState();
     this.log('info', '外参已设回输入值，等待重新初始化');
+  }
+
+  /**
+   * Commit a new firmware's calibration record. The generation must increase;
+   * snapshots stamped with the old generation become stale and are rejected by
+   * the overlays. The state resets and re-bootstraps under the new conversion.
+   */
+  commitFirmware(next: CalibrationRecord): boolean {
+    if (next.status !== 'committed') {
+      this.log('error', `拒绝启用 ${next.firmware} 标定：记录仍是预览态（镜像歧义未排除）`);
+      return false;
+    }
+    if (next.generation <= this.record.generation) {
+      this.log('error', `拒绝启用 ${next.firmware} 标定：代际 ${next.generation} 未超过当前 ${this.record.generation}`);
+      return false;
+    }
+    this.record = next;
+    this.preintegrator = new GyroPreintegrator(next);
+    this.session.setConventionResolver((fw) => this.preintegrator.conventionFor(fw));
+    this.resetState();
+    this.log('info', `已固化 ${next.firmware} 标定（代 ${next.generation}），旧换算快照一律拒绝`);
+    return true;
   }
 
   resetState(): void {
@@ -467,6 +488,11 @@ export class InertialLensKernel {
     if (!this.opts.useInertialPropagation) return;
     const prevT = this.session.cameraTimes[this.frameIndex - 1];
     const samples = this.session.imuBetween(prevT, t, this.timeOffset);
+    const unknown = this.session.unknownFirmwareInfo();
+    if (unknown && t >= unknown.firstT && this.frameIndex - this.lastFirmwareWarnFrame >= 20) {
+      this.lastFirmwareWarnFrame = this.frameIndex;
+      this.log('warn', `固件 ${unknown.fw} 的样本没有已固化标定：惯推暂停，等待固化新标定（不会用默认轴系换算）`);
+    }
     for (let i = 1; i < samples.length; i++) {
       const a = samples[i - 1];
       const b = samples[i];
@@ -531,7 +557,6 @@ export class InertialLensKernel {
         else rejected++;
       }
     }
-    this.frames.length; // no-op
     if (used > 0) {
       for (const v of this.eskf.lastVisualResiduals.slice(-used)) reproj.push(v);
       this.eskf.lastVisualResiduals = [];
@@ -597,8 +622,6 @@ export class InertialLensKernel {
 
   private monitorBiasStep(rel: RelativeVisualPose | null): void {
     if (!this.opts.detectBiasSteps || !rel || !this.eskf) return;
-    const prevT = this.session.cameraTimes[this.frameIndex - 1];
-    const t = this.session.cameraTimes[this.frameIndex];
     const dRgyro = this.session.gyroRotation(this.frameIndex - 1, this.frameIndex, this.timeOffset, this.eskf.bg);
     if (!dRgyro) return;
     // rel.R is the camera-frame forward increment; the body-frame gyro increment
@@ -619,8 +642,6 @@ export class InertialLensKernel {
         this.log('warn', `检测到陀螺-视觉旋转不一致（平均 ${avg.toFixed(2)}°/帧）：放大陀螺偏置协方差，交由视觉更新重新收敛`);
       }
     }
-    void prevT;
-    void t;
   }
 
   private captureKeyframe(index: number): void {

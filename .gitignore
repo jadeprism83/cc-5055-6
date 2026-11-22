@@ -2,6 +2,7 @@
 node_modules/
 vendor/
 dist/
+dist-cli/
 build/
 .next/
 .nuxt/

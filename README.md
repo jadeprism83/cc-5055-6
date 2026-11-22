@@ -27,39 +27,65 @@ npm run dev
 ```bash
 npm run build      # tsc --noEmit && vite build
 npm run preview    # 预览 dist/
-npm test           # vitest 全量（23 项，约 3 分钟）
+npm test           # vitest 全量（41 项，约 4 分钟）
 ```
+
+命令行仅作辅助（图形入口仍是上面的 `npm run dev`）：
+
+```bash
+npm run validate           # 惯性资料校验与传感约定维护检查（10 项，可在清洁目录执行）
+npm run docs:conventions   # 重新生成 docs/sensor-conventions.md 的机器核对示例块
+```
+
+传感器轴系、角速度单位、时间戳、相机外参与固件标定流程见
+[docs/sensor-conventions.md](docs/sensor-conventions.md)；文中数值示例由代码生成并被测试核对。
 
 ## 窗口里能看到什么
 
 - **镜头画面**：当前 RGB 帧 + 绿色跟踪点；固定的虚拟标记（青色环 = 估计投影，
-  品红十叉 = 真值投影）随镜头移动检查稳定性，并显示二者像素差。
+  品红十叉 = 真值投影）随镜头移动检查稳定性，并显示二者像素差；虚拟地面接触点
+  （相机中心正下方的地面点）以青色/品红菱形显示，偏差出现在状态栏与俯视轨迹图中。
 - **残差面板**：使用/跟踪点数、剔除数、重投影 RMS/P95、光流残差、旋转残差、
   位置/姿态 sigma、陀螺/加计偏置、地标数、重定位次数。
 - **轨迹图**：x-y 俯视，绿色 = 估计，灰色虚线 = 真值，橙色 = 留出帧（未参与优化），
-  蓝色 = 当前位置。
-- **可观测性台账**：列出哪些量被可靠恢复、哪些没有依据（尺度、重力方向、平移）。
-- **事件日志**：状态迁移（tracking → inertial → lost）、视觉丢失、偏置放大等。
+  蓝色 = 当前位置，青/品红菱形 = 触点估计/真值。
+- **可观测性台账**：列出哪些量被可靠恢复、哪些没有依据（尺度、重力方向、平移），
+  以及当前固化的传感约定（固件、单位、代际）。
+- **事件日志**：状态迁移（tracking → inertial → lost）、视觉丢失、偏置放大、
+  未知固件惯推暂停，以及界面侧异常（角标/触点偏差超阈值、旧换算快照被拒绝）。
+- **固件更换演示**：工具栏按钮把 t≥6 s 的 IMU 样本换成未固化的 fw-B——惯推暂停并
+  告警（不会用默认轴系换算）；「固化 fw-B 标定」提交代际 +1 的标定记录并重引导，
+  旧代际的迟到快照会被角标与触点同时拒绝。
 
 ## 架构
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/sim/trajectory.ts` | 生成轨迹、噪声图像与机体系陀螺/加计 |
+| `src/core/conventions.ts` | 传感约定：轴系映射、角速度/加速度单位、可逆固件转换器、静止/转动检查 |
+| `src/sim/trajectory.ts` | 生成轨迹、噪声图像与机体系陀螺/加计（支持固件更换注入） |
+| `src/sim/analytic.ts` | 解析运动生成器（精确角速度/比力公式），核对文档图示与积分链路 |
 | `src/vision/` | 场景渲染、Harris 角点、KLT 光流、描述子匹配 |
 | `src/estimation/eskf.ts` | 15 维误差状态卡尔曼滤波（位置/速度/姿态/陀螺偏置/加计偏置） |
 | `src/lens/bootstrap.ts` | 陀螺姿态链 + 多视图平移 SfM（Schur 补线性求解）+ 尺度拟合 |
-| `src/lens/kernel.ts` | 镜头内核：跟踪、惯推、视觉更新、重定位、失败反馈、留出帧 |
+| `src/lens/record.ts` | 标定记录：静止预览（保留镜像候选）、有序转动固化、导出/读入校验 |
+| `src/lens/preintegration.ts` | 陀螺预积分器：按记录中已固化约定换算并积分，快照盖代际 |
+| `src/lens/shutter.ts` | 卷帘快门去斜：与预积分器引用同一标定记录 |
+| `src/lens/overlays.ts` | 角标与虚拟地面接触点投影；拒绝旧代际快照 |
+| `src/lens/kernel.ts` | 镜头内核：跟踪、惯推、视觉更新、重定位、失败反馈、留出帧、固件固化 |
 | `src/lens/replay.ts` | 浏览器/测试共享的采集管线（`buildCapture`） |
+| `src/lens/validation.ts` | 惯性资料校验与维护检查（10 项，`npm run validate`） |
+| `src/lens/docExamples.ts` | 文档数值示例的机器生成（`npm run docs:conventions`） |
 | `src/ui/main.ts` | 镜头跟踪窗口（原生 DOM + Canvas） |
-| `tests/` | 端到端、标定、反作弊、数学/视觉单元测试 |
+| `tests/` | 端到端、标定、约定维护、校验报告、反作弊、数学/视觉单元测试 |
 
 ## 关键约定
 
 - 载体：x 前、y 左、z 上；相机：x 右、y 下、z 前。
 - `R_bc` 将相机坐标映射到机体系；相机中心 `C = p_wb + R_wb · t_bc`。
-- 陀螺为机体系角速度；姿态传播 `R_wb(k) = R_wb(k-1) · ΔR`。
+- 陀螺为机体系角速度（rad/s）；姿态传播 `R_wb(k) = R_wb(k-1) · ΔR`。
 - 视觉两视图相对旋转 `rel.R = R_bcᵀ · ΔRᵀ · R_bc`，与 `relativeRotationCamera` 一致。
+- 各固件的原始读数经**传感约定**换算进机体系（轴系映射 + 单位），约定由标定记录
+  固化；未知固件的样本一律丢弃，不套用默认轴系。详见 docs/sensor-conventions.md。
 
 ## 反作弊
 

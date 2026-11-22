@@ -237,62 +237,6 @@ export function searchTimeOffset(
 }
 
 /**
- * Estimate a constant gyro-bias correction from cumulative visual vs gyro
- * rotations. If dR_meas = Exp((w-b_guess)dt) then the visual cumulative rotation
- * equals the gyro cumulative rotation pre-multiplied by Exp(-db*t) to first
- * order, so db = -sum(t * log(R_gyro^T R_vis)) / sum(t^2).
- */
-export function refineGyroBias(
-  input: BootstrapInput,
-  timeOffset: number,
-  bgGuess: Vec3,
-  iterations = 3,
-): { bg: Vec3; residualDegPerSec: number } {
-  const { cameraTimes, imu, relative, R_bc } = input;
-  let bg: Vec3 = [bgGuess[0], bgGuess[1], bgGuess[2]];
-  let residual = 0;
-  for (let iter = 0; iter < iterations; iter++) {
-    // Cumulative rotations from the start of the window.
-    let R_visCam = m3identity();
-    let R_gyroCam = m3identity();
-    let sumT2 = 0;
-    const accum: Vec3 = [0, 0, 0];
-    const tStart = cameraTimes[input.start];
-    let lastK = input.start;
-    for (let k = input.start + 1; k <= input.end; k++) {
-      const rel = relative.get(k);
-      if (!rel) continue;
-      // Only chain contiguous pairs; a gap resets the comparison.
-      if (k !== lastK + 1) {
-        R_visCam = m3identity();
-        R_gyroCam = m3identity();
-        sumT2 = 0;
-        accum[0] = accum[1] = accum[2] = 0;
-      }
-      lastK = k;
-      R_visCam = m3mul(R_visCam, rel.R);
-      const dR = integrateRotation(imu, cameraTimes[k - 1], cameraTimes[k], timeOffset, bg).dR;
-      // rel.R is the camera-frame increment R_bc^T dR^T R_bc (see searchTimeOffset).
-      const dRcam = m3mul(m3transpose(R_bc), m3mul(m3transpose(dR), R_bc));
-      R_gyroCam = m3mul(R_gyroCam, dRcam);
-      const t = cameraTimes[k] - tStart;
-      if (t <= 0.2) continue;
-      const r = so3Log(m3mul(m3transpose(R_visCam), R_gyroCam));
-      accum[0] += t * r[0];
-      accum[1] += t * r[1];
-      accum[2] += t * r[2];
-      sumT2 += t * t;
-    }
-    if (sumT2 < 1e-6) break;
-    const db: Vec3 = [-accum[0] / sumT2, -accum[1] / sumT2, -accum[2] / sumT2];
-    bg = v3add(bg, db);
-    residual = v3norm(db);
-    if (residual < 1e-5) break;
-  }
-  return { bg, residualDegPerSec: residual * (180 / Math.PI) };
-}
-
-/**
  * Gyro-propagated body attitude over the bootstrap window. The increments are
  * body-frame rotations, so R_wb(k) = dR(k) R_wb(k-1) (pre-multiply); this was
  * verified against the simulator to 0.4 deg RMS. The anchor comes from measured
@@ -786,6 +730,15 @@ export function runBootstrap(
   // `input.start` here (the first *estimation* frame) lies after motion onset and
   // would give an empty window, zero bias and a wrong gravity direction.
   const staticInit = staticInitialisation(input.imu, input.cameraTimes, 0, staticEnd, input.timeOffsetGuess);
+  if (staticInit.samples < 5) {
+    // No default gravity or zero bias is substituted: missing static data is a
+    // hard failure, reported with the sample count.
+    return failedBootstrap(
+      { offset: opts.timeOffsetGuess, score: Infinity, curve: [] },
+      { bg: [0, 0, 0], residualDegPerSec: 0 },
+      `静止窗口 IMU 样本不足（${staticInit.samples} 个）：拒绝以默认重力/零偏置初始化`,
+    );
+  }
   const bgStatic = staticInit.wMean;
   const offsetSearch = searchTimeOffset(input, bgStatic, opts.timeOffsetGuess);
   // The still window measures the bias directly. Refining it against the visual

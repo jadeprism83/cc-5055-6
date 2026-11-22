@@ -1,5 +1,6 @@
-import { Mat3, Vec3, m3mul, m3transpose, so3Exp, v3add, v3scale, v3sub } from '../core/math';
+import { Mat3, Vec3, v3add, v3scale, v3sub } from '../core/math';
 import { Extrinsics, Intrinsics } from '../core/camera';
+import { SensorConvention, accelToBody, firmwareA, gyroToBody } from '../core/conventions';
 import { ImuSample } from '../sim/trajectory';
 import { FrameFeatures, TrackPoint } from '../vision/tracker';
 import { estimateRotationFirst } from '../estimation/relpose';
@@ -19,6 +20,9 @@ export interface TrackObs {
   confidence: number;
 }
 
+/** Maps a firmware id to its committed convention; null = no committed conversion. */
+export type ConventionResolver = (fw: string) => SensorConvention | null;
+
 export interface SensorSession {
   cameraTimes: number[];
   imu: ImuSample[];
@@ -33,10 +37,21 @@ export interface SensorSession {
   relativePoses: Map<number, RelativeVisualPose>;
   /** Median forward-backward flow residual per frame, pixels. */
   flowResidual: number[];
-  /** Interpolated IMU between physical times (camera clock). */
+  /** Interpolated IMU between physical times (camera clock), body frame. */
   imuBetween(t0: number, t1: number, offset: number): ImuSample[];
   /** Body-frame rotation between two camera frames, bias removed. */
   gyroRotation(fromK: number, toK: number, offset: number, bg: Vec3): Mat3 | null;
+  /** Install the resolver that converts each firmware's samples to the body frame. */
+  setConventionResolver(fn: ConventionResolver): void;
+  /** IMU stream converted to body frame with the committed conventions. */
+  imuBody(): ImuSample[];
+  /** Firmware seen in the raw stream without a committed convention, if any. */
+  unknownFirmwareInfo(): { fw: string; firstT: number } | null;
+  /**
+   * Replace the raw IMU stream (firmware swap demo). The convention resolver is
+   * kept; the conversion cache is invalidated so the new stream is re-normalised.
+   */
+  replaceImu(samples: ImuSample[]): void;
 }
 
 export interface SessionBuildOptions {
@@ -84,12 +99,13 @@ export function buildSession(
   }
 
   const imuBetween = (t0: number, t1: number, offset: number): ImuSample[] => {
+    const body = normalizedImu();
     const a0 = t0 - offset;
     const a1 = t1 - offset;
     const out: ImuSample[] = [];
     if (a1 <= a0) return out;
     let prev: ImuSample | null = null;
-    for (const s of imu) {
+    for (const s of body) {
       if (s.t <= a0) {
         prev = s;
         continue;
@@ -110,10 +126,51 @@ export function buildSession(
 
   const gyroRotation = (fromK: number, toK: number, offset: number, bg: Vec3): Mat3 | null => {
     if (fromK < 0 || toK >= cameraTimes.length || toK <= fromK) return null;
-    const r = integrateRotation(imu, cameraTimes[fromK], cameraTimes[toK], offset, bg);
+    const r = integrateRotation(normalizedImu(), cameraTimes[fromK], cameraTimes[toK], offset, bg);
     if (r.samples < 2) return null;
     return r.dR;
   };
+
+  // Convention handling: raw samples keep their firmware tag; the resolver
+  // (installed by the kernel from its calibration record) supplies the
+  // committed conversion per firmware. Samples whose firmware has no committed
+  // convention are dropped from the body-frame stream, never default-converted.
+  let resolver: ConventionResolver = (() => {
+    const fwA = firmwareA();
+    return (fw: string) => (fw === fwA.firmware ? fwA : null);
+  })();
+  let resolverVersion = 0;
+  let normCache: { version: number; samples: ImuSample[]; unknown: { fw: string; firstT: number } | null } | null = null;
+
+  const convertSample = (s: ImuSample): ImuSample | null => {
+    if (!s.fw) return s;
+    const conv = resolver(s.fw);
+    if (!conv) return null;
+    return {
+      t: s.t,
+      gyro: gyroToBody(conv, s.gyro),
+      accel: accelToBody(conv, s.accel),
+      fw: s.fw,
+      trueGyroBias: s.trueGyroBias,
+      trueAccelBias: s.trueAccelBias,
+    };
+  };
+
+  function normalizedImu(): ImuSample[] {
+    if (normCache && normCache.version === resolverVersion) return normCache.samples;
+    const out: ImuSample[] = [];
+    let unknown: { fw: string; firstT: number } | null = null;
+    for (const s of imu) {
+      const c = convertSample(s);
+      if (c) {
+        out.push(c);
+      } else if (!unknown && s.fw) {
+        unknown = { fw: s.fw, firstT: s.t };
+      }
+    }
+    normCache = { version: resolverVersion, samples: out, unknown };
+    return out;
+  }
 
   return {
     cameraTimes,
@@ -129,6 +186,24 @@ export function buildSession(
     flowResidual,
     imuBetween,
     gyroRotation,
+    setConventionResolver(fn: ConventionResolver): void {
+      resolver = fn;
+      resolverVersion++;
+      normCache = null;
+    },
+    imuBody(): ImuSample[] {
+      return normalizedImu();
+    },
+    unknownFirmwareInfo(): { fw: string; firstT: number } | null {
+      normalizedImu();
+      return normCache ? normCache.unknown : null;
+    },
+    replaceImu(samples: ImuSample[]): void {
+      imu = samples;
+      this.imu = samples;
+      resolverVersion++;
+      normCache = null;
+    },
   };
 }
 
@@ -141,13 +216,3 @@ function interpImu(a: ImuSample, b: ImuSample, t: number): ImuSample {
     accel: v3add(a.accel, v3scale(v3sub(b.accel, a.accel), s)),
   };
 }
-
-// Small helpers so the session can be transformed without touching truth.
-export function rotateBy(R: Mat3, v: Vec3): Vec3 {
-  return [R[0] * v[0] + R[1] * v[1] + R[2] * v[2], R[3] * v[0] + R[4] * v[1] + R[5] * v[2], R[6] * v[0] + R[7] * v[1] + R[8] * v[2]];
-}
-export const cameraRelFromBody = (R_bc: Mat3, dR_body: Mat3): Mat3 =>
-  m3mul(m3transpose(R_bc), m3mul(dR_body, R_bc));
-export const bodyRelFromCamera = (R_bc: Mat3, dR_cam: Mat3): Mat3 =>
-  m3mul(R_bc, m3mul(dR_cam, m3transpose(R_bc)));
-export const rotExp = so3Exp;

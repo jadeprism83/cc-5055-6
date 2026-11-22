@@ -1,6 +1,5 @@
 import { Matrix, SingularValueDecomposition } from 'ml-matrix';
-import { Mat3, Vec3, m3mul, m3transpose, so3Log, v3norm, v3sub } from '../core/math';
-import { rotationErrorAngle } from '../estimation/eskf';
+import { Mat3, Vec3, v3norm, v3sub, so3Log } from '../core/math';
 
 // Camera-IMU rotation calibration (hand-eye, rotation only) from paired relative
 // rotations: A_i = dR_body, B_i = dR_cam, with A_i X = X B_i and X = R_bc.
@@ -95,12 +94,4 @@ function det3(m: Matrix): number {
 
 function apply3(R: Mat3, v: Vec3): Vec3 {
   return [R[0] * v[0] + R[1] * v[1] + R[2] * v[2], R[3] * v[0] + R[4] * v[1] + R[5] * v[2], R[6] * v[0] + R[7] * v[1] + R[8] * v[2]];
-}
-
-export function extrinsicRotationErrorDeg(solved: Mat3, truth: Mat3): number {
-  return rotationErrorAngle(solved, truth) * (180 / Math.PI);
-}
-
-export function extrinsicToBody(R_bc: Mat3, p_c: Vec3): Vec3 {
-  return apply3(R_bc, p_c);
 }

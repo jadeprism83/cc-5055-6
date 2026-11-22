@@ -1,4 +1,4 @@
-import { Mat3, Vec3, m3mul, m3mulVec, m3transpose, v3add, v3norm, v3sub } from '../core/math';
+import { Mat3, Vec3, m3mulVec, v3norm, v3sub } from '../core/math';
 import { rotationErrorAngle } from '../estimation/eskf';
 
 // Evaluation code lives apart from the estimator. It is allowed to read truth and
@@ -148,23 +148,6 @@ export function absoluteTrajectoryError(est: Vec3[], truth: Vec3[]): TrajectoryE
   };
 }
 
-/** Relative pose error at a fixed frame gap, translation in metres (no scale fit). */
-export function relativeTrajectoryError(est: Vec3[], truth: Vec3[], gap = 10): { rpe: number; rpeRot: number; samples: number } {
-  if (est.length <= gap || truth.length <= gap) return { rpe: NaN, rpeRot: NaN, samples: 0 };
-  let sse = 0;
-  let rotSse = 0;
-  let n = 0;
-  for (let i = 0; i + gap < Math.min(est.length, truth.length); i++) {
-    const de = v3sub(est[i + gap], est[i]);
-    const dt = v3sub(truth[i + gap], truth[i]);
-    const err = v3norm(v3sub(de, dt));
-    sse += err * err;
-    rotSse += 0; // filled by caller with orientations
-    n++;
-  }
-  return { rpe: Math.sqrt(sse / Math.max(1, n)), rpeRot: Math.sqrt(rotSse / Math.max(1, n)), samples: n };
-}
-
 export function rotationAte(estR: Mat3[], truthR: Mat3[]): number {
   const n = Math.min(estR.length, truthR.length);
   if (n === 0) return NaN;
@@ -175,61 +158,3 @@ export function rotationAte(estR: Mat3[], truthR: Mat3[]): number {
   }
   return (Math.sqrt(s / n) * 180) / Math.PI;
 }
-
-export interface HoldoutCheck {
-  /** Reprojection error on observations withheld from the filter. */
-  holdoutReprojRms: number;
-  holdoutCount: number;
-  /** Error on a withheld motion interval. */
-  intervalError: number;
-  /** Whether held-out data could support the claim. */
-  valid: boolean;
-  note: string;
-}
-
-/**
- * Evaluate held-out frames: run the estimator state against truth for frames
- * excluded from optimisation, and report the residual. This is what separates a
- * real fit from a copied curve.
- */
-export function holdoutValidation(
-  predicted: Vec3[],
-  truth: Vec3[],
-  holdoutIdx: number[],
-): HoldoutCheck {
-  if (holdoutIdx.length === 0) {
-    return { holdoutReprojRms: NaN, holdoutCount: 0, intervalError: NaN, valid: false, note: '没有留出帧，无法做独立检验' };
-  }
-  let sse = 0;
-  let n = 0;
-  for (const i of holdoutIdx) {
-    if (i >= predicted.length || i >= truth.length) continue;
-    const e = v3norm(v3sub(predicted[i], truth[i]));
-    sse += e * e;
-    n++;
-  }
-  if (n === 0) return { holdoutReprojRms: NaN, holdoutCount: 0, intervalError: NaN, valid: false, note: '留出帧索引越界' };
-  const rms = Math.sqrt(sse / n);
-  return {
-    holdoutReprojRms: rms,
-    holdoutCount: n,
-    intervalError: rms,
-    valid: true,
-    note: `留出 ${n} 帧，位置残差 RMS ${rms.toFixed(3)} m（这些帧未参与滤波更新或标定）`,
-  };
-}
-
-export function cameraCentersFromBody(
-  R_wb: Mat3[],
-  p_wb: Vec3[],
-  R_bc: Mat3,
-  t_bc: Vec3,
-): Vec3[] {
-  const out: Vec3[] = [];
-  for (let i = 0; i < p_wb.length; i++) {
-    out.push(v3add(p_wb[i], m3mulVec(R_wb[i], t_bc)));
-  }
-  return out;
-}
-
-export { m3mul, m3transpose };
